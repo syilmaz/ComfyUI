@@ -52,6 +52,7 @@ try:
 except:
     pass
 
+print(args.cpu)
 if args.cpu:
     cpu_state = CPUState.CPU
 
@@ -62,6 +63,7 @@ def get_torch_device():
     if directml_enabled:
         global directml_device
         return directml_device
+    print(cpu_state)
     if cpu_state == CPUState.MPS:
         return torch.device("mps")
     if cpu_state == CPUState.CPU:
