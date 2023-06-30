@@ -73,7 +73,7 @@ parser.add_argument("--dont-print-server", action="store_true", help="Don't prin
 parser.add_argument("--quick-test-for-ci", action="store_true", help="Quick test for CI.")
 parser.add_argument("--windows-standalone-build", action="store_true", help="Windows standalone build: Enable convenient things that most people using the standalone windows build will probably enjoy (like auto opening the page on startup).")
 
-args = parser.parse_args(sys.argv)
+args = parser.parse_args(sys.argv[1:])
 
 if args.windows_standalone_build:
     args.auto_launch = True
