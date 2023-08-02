@@ -3,7 +3,6 @@ import math
 from scipy import integrate
 import torch
 from torch import nn
-from torchdiffeq import odeint
 import torchsde
 from tqdm.auto import trange, tqdm
 
@@ -66,6 +65,9 @@ class BatchedBrownianTree:
     """A wrapper around torchsde.BrownianTree that enables batches of entropy."""
 
     def __init__(self, x, t0, t1, seed=None, **kwargs):
+        self.cpu_tree = True
+        if "cpu" in kwargs:
+            self.cpu_tree = kwargs.pop("cpu")
         t0, t1, self.sign = self.sort(t0, t1)
         w0 = kwargs.get('w0', torch.zeros_like(x))
         if seed is None:
@@ -77,7 +79,10 @@ class BatchedBrownianTree:
         except TypeError:
             seed = [seed]
             self.batched = False
-        self.trees = [torchsde.BrownianTree(t0.cpu(), w0.cpu(), t1.cpu(), entropy=s, **kwargs) for s in seed]
+        if self.cpu_tree:
+            self.trees = [torchsde.BrownianTree(t0.cpu(), w0.cpu(), t1.cpu(), entropy=s, **kwargs) for s in seed]
+        else:
+            self.trees = [torchsde.BrownianTree(t0, w0, t1, entropy=s, **kwargs) for s in seed]
 
     @staticmethod
     def sort(a, b):
@@ -85,7 +90,11 @@ class BatchedBrownianTree:
 
     def __call__(self, t0, t1):
         t0, t1, sign = self.sort(t0, t1)
-        w = torch.stack([tree(t0.cpu().float(), t1.cpu().float()).to(t0.dtype).to(t0.device) for tree in self.trees]) * (self.sign * sign)
+        if self.cpu_tree:
+            w = torch.stack([tree(t0.cpu().float(), t1.cpu().float()).to(t0.dtype).to(t0.device) for tree in self.trees]) * (self.sign * sign)
+        else:
+            w = torch.stack([tree(t0, t1) for tree in self.trees]) * (self.sign * sign)
+
         return w if self.batched else w[0]
 
 
@@ -104,10 +113,10 @@ class BrownianTreeNoiseSampler:
             internal timestep.
     """
 
-    def __init__(self, x, sigma_min, sigma_max, seed=None, transform=lambda x: x):
+    def __init__(self, x, sigma_min, sigma_max, seed=None, transform=lambda x: x, cpu=False):
         self.transform = transform
         t0, t1 = self.transform(torch.as_tensor(sigma_min)), self.transform(torch.as_tensor(sigma_max))
-        self.tree = BatchedBrownianTree(x, t0, t1, seed)
+        self.tree = BatchedBrownianTree(x, t0, t1, seed, cpu=cpu)
 
     def __call__(self, sigma, sigma_next):
         t0, t1 = self.transform(torch.as_tensor(sigma)), self.transform(torch.as_tensor(sigma_next))
@@ -121,9 +130,9 @@ def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None,
     s_in = x.new_ones([x.shape[0]])
     for i in trange(len(sigmas) - 1, disable=disable):
         gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
-        eps = torch.randn_like(x) * s_noise
         sigma_hat = sigmas[i] * (gamma + 1)
         if gamma > 0:
+            eps = torch.randn_like(x) * s_noise
             x = x + eps * (sigma_hat ** 2 - sigmas[i] ** 2) ** 0.5
         denoised = model(x, sigma_hat * s_in, **extra_args)
         d = to_d(x, sigma_hat, denoised)
@@ -162,9 +171,9 @@ def sample_heun(model, x, sigmas, extra_args=None, callback=None, disable=None, 
     s_in = x.new_ones([x.shape[0]])
     for i in trange(len(sigmas) - 1, disable=disable):
         gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
-        eps = torch.randn_like(x) * s_noise
         sigma_hat = sigmas[i] * (gamma + 1)
         if gamma > 0:
+            eps = torch.randn_like(x) * s_noise
             x = x + eps * (sigma_hat ** 2 - sigmas[i] ** 2) ** 0.5
         denoised = model(x, sigma_hat * s_in, **extra_args)
         d = to_d(x, sigma_hat, denoised)
@@ -191,9 +200,9 @@ def sample_dpm_2(model, x, sigmas, extra_args=None, callback=None, disable=None,
     s_in = x.new_ones([x.shape[0]])
     for i in trange(len(sigmas) - 1, disable=disable):
         gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
-        eps = torch.randn_like(x) * s_noise
         sigma_hat = sigmas[i] * (gamma + 1)
         if gamma > 0:
+            eps = torch.randn_like(x) * s_noise
             x = x + eps * (sigma_hat ** 2 - sigmas[i] ** 2) ** 0.5
         denoised = model(x, sigma_hat * s_in, **extra_args)
         d = to_d(x, sigma_hat, denoised)
@@ -275,30 +284,6 @@ def sample_lms(model, x, sigmas, extra_args=None, callback=None, disable=None, o
         coeffs = [linear_multistep_coeff(cur_order, sigmas_cpu, i, j) for j in range(cur_order)]
         x = x + sum(coeff * d for coeff, d in zip(coeffs, reversed(ds)))
     return x
-
-
-@torch.no_grad()
-def log_likelihood(model, x, sigma_min, sigma_max, extra_args=None, atol=1e-4, rtol=1e-4):
-    extra_args = {} if extra_args is None else extra_args
-    s_in = x.new_ones([x.shape[0]])
-    v = torch.randint_like(x, 2) * 2 - 1
-    fevals = 0
-    def ode_fn(sigma, x):
-        nonlocal fevals
-        with torch.enable_grad():
-            x = x[0].detach().requires_grad_()
-            denoised = model(x, sigma * s_in, **extra_args)
-            d = to_d(x, sigma, denoised)
-            fevals += 1
-            grad = torch.autograd.grad((d * v).sum(), x)[0]
-            d_ll = (v * grad).flatten(1).sum(1)
-        return d.detach(), d_ll
-    x_min = x, x.new_zeros([x.shape[0]])
-    t = x.new_tensor([sigma_min, sigma_max])
-    sol = odeint(ode_fn, x_min, t, atol=atol, rtol=rtol, method='dopri5')
-    latent, delta_ll = sol[0][-1], sol[1][-1]
-    ll_prior = torch.distributions.Normal(0, sigma_max).log_prob(latent).flatten(1).sum(1)
-    return ll_prior + delta_ll, {'fevals': fevals}
 
 
 class PIDStepSizeController:
@@ -544,7 +529,7 @@ def sample_dpmpp_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
     """DPM-Solver++ (stochastic)."""
     sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
     seed = extra_args.get("seed", None)
-    noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=seed) if noise_sampler is None else noise_sampler
+    noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=seed, cpu=True) if noise_sampler is None else noise_sampler
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
     sigma_fn = lambda t: t.neg().exp()
@@ -616,7 +601,7 @@ def sample_dpmpp_2m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
 
     seed = extra_args.get("seed", None)
     sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
-    noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=seed) if noise_sampler is None else noise_sampler
+    noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=seed, cpu=True) if noise_sampler is None else noise_sampler
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
 
@@ -651,3 +636,18 @@ def sample_dpmpp_2m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
         old_denoised = denoised
         h_last = h
     return x
+
+@torch.no_grad()
+def sample_dpmpp_2m_sde_gpu(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None, solver_type='midpoint'):
+    sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
+    noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=extra_args.get("seed", None), cpu=False) if noise_sampler is None else noise_sampler
+    return sample_dpmpp_2m_sde(model, x, sigmas, extra_args=extra_args, callback=callback, disable=disable, eta=eta, s_noise=s_noise, noise_sampler=noise_sampler, solver_type=solver_type)
+
+
+@torch.no_grad()
+def sample_dpmpp_sde_gpu(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None, r=1 / 2):
+    sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
+    noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=extra_args.get("seed", None), cpu=False) if noise_sampler is None else noise_sampler
+    return sample_dpmpp_sde(model, x, sigmas, extra_args=extra_args, callback=callback, disable=disable, eta=eta, s_noise=s_noise, noise_sampler=noise_sampler, r=r)
+
+
